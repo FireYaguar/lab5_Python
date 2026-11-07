@@ -5,11 +5,12 @@ from __future__ import annotations
 import functools
 import logging
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from findex.corpus import Document
+from findex.corpus import Document, iter_paths
 from findex.timing import timed
 from findex.tokenize import tokenize
 
@@ -128,12 +129,28 @@ class Index(Mapping[str, list[Posting]]):
         self.__init__(**state)
 
 
-@timed
-def build_index(docs: Iterable[Document], *, positions: bool = False) -> Index:
+type RawPosting = tuple[int, int, tuple[int, ...]]  # (doc_id, tf, positions)
+
+
+@dataclass(slots=True)
+class PartialIndex:
+    """What one worker returns: postings for its own doc_id range (Lab 5).
+
+    Postings are plain tuples (doc_id, tf, positions), not Posting objects: tuples pickle
+    ~10x faster between processes; merge() turns them into Postings in the parent."""
+
+    start_id: int
+    postings: dict[str, list[RawPosting]]
+    doc_lengths: dict[int, int]
+    doc_meta: dict[int, DocMeta]
+    has_positions: bool
+
+
+def _accumulate(docs: Iterable[Document], positions: bool, start_id: int = 0) -> PartialIndex:
     """One streaming pass. Per document we keep a Counter (or term -> positions),
     flush it into the postings and drop it. doc_ids arrive increasing, so every
     postings list is sorted by doc_id without an explicit sort."""
-    postings: defaultdict[str, list[Posting]] = defaultdict(list)
+    postings: defaultdict[str, list[RawPosting]] = defaultdict(list)
     doc_lengths: dict[int, int] = {}
     doc_meta: dict[int, DocMeta] = {}
     for doc in docs:
@@ -143,13 +160,49 @@ def build_index(docs: Iterable[Document], *, positions: bool = False) -> Index:
             for n, tok in enumerate(tokenize(doc.text), 1):
                 pos[tok].append(n - 1)
             for term, ps in pos.items():
-                postings[term].append(Posting(doc.doc_id, len(ps), tuple(ps)))
+                postings[term].append((doc.doc_id, len(ps), tuple(ps)))
             length = n
         else:
             counts = Counter(tokenize(doc.text))
             for term, tf in counts.items():
-                postings[term].append(Posting(doc.doc_id, tf))
+                postings[term].append((doc.doc_id, tf, ()))
             length = counts.total()
         doc_lengths[doc.doc_id] = length
         doc_meta[doc.doc_id] = DocMeta(doc.doc_id, doc.path, doc.title)
-    return Index(dict(postings), doc_lengths, doc_meta, positions)
+    return PartialIndex(start_id, dict(postings), doc_lengths, doc_meta, positions)
+
+
+@timed
+def build_index(docs: Iterable[Document], *, positions: bool = False) -> Index:
+    """Single-process build from any stream of documents."""
+    return merge([_accumulate(docs, positions)])
+
+
+def build_partial(paths: Sequence[Path], start_id: int, positions: bool = False) -> PartialIndex:
+    """Index the files `paths`; their doc_ids start at start_id (ranges are assigned up
+    front, so ids are unique across chunks). Module-level => picklable for processes.
+    Gets *paths*, not documents: each worker reads its own files."""
+    return _accumulate(iter_paths(paths, start_id), positions, start_id)
+
+
+@timed
+def merge(partials: Iterable[PartialIndex]) -> Index:
+    """Reduce step: concatenate postings per term in doc_id order. Partials cover
+    disjoint, increasing id ranges, so concatenation keeps every list sorted.
+    Sequential — the Amdahl part of a parallel build."""
+    parts = sorted(partials, key=lambda p: p.start_id)
+    postings: dict[str, list[Posting]] = {}
+    doc_lengths: dict[int, int] = {}
+    doc_meta: dict[int, DocMeta] = {}
+    for part in parts:
+        for term, raw in part.postings.items():
+            objs = [Posting(d, tf, pos) for d, tf, pos in raw]
+            existing = postings.get(term)
+            if existing is None:
+                postings[term] = objs
+            else:
+                existing.extend(objs)
+        doc_lengths.update(part.doc_lengths)
+        doc_meta.update(part.doc_meta)
+    positions = parts[0].has_positions if parts else False
+    return Index(postings, doc_lengths, doc_meta, positions)

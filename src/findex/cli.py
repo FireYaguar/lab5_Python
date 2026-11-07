@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import pickle
-from collections.abc import Iterator
+import time
 from enum import StrEnum
 from itertools import islice
 from pathlib import Path
@@ -23,8 +24,8 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, T
 from rich.table import Table
 
 from findex import __version__
-from findex.corpus import Document, count_documents, iter_documents
-from findex.index import build_index
+from findex.corpus import iter_documents, list_sources
+from findex.parallel import build_parallel
 from findex.query import QueryError
 from findex.search import match, search
 from findex.stats import compute_stats, compute_stats_eager, measure
@@ -34,6 +35,12 @@ app = typer.Typer(help="findex — a small full-text search engine.", no_args_is
 out = Console()  # stdout: data
 err = Console(stderr=True)  # stderr: diagnostics
 log = logging.getLogger("findex.cli")
+
+
+class ExecutorChoice(StrEnum):
+    serial = "serial"
+    threads = "threads"
+    processes = "processes"
 
 
 class ScorerName(StrEnum):  # typer needs an Enum for choices; the library uses Literal
@@ -78,14 +85,20 @@ def index_cmd(
     positions: Annotated[
         bool, typer.Option(help="Store token positions (phrase queries).")
     ] = False,
-    limit: Annotated[int | None, typer.Option(help="Only the first N documents.")] = None,
+    limit: Annotated[int | None, typer.Option(help="Only the first N files.")] = None,
+    workers: Annotated[int, typer.Option("--workers", "-w", min=1, help="Parallel workers.")] = (
+        os.cpu_count() or 1
+    ),
+    executor: Annotated[
+        ExecutorChoice, typer.Option(help="serial loop, thread pool or process pool.")
+    ] = ExecutorChoice.processes,
 ) -> None:
-    """Build the inverted index and save it."""
+    """Build the inverted index (map: build_partial per chunk, reduce: merge) and save it."""
     if not corpus.exists():
         fail(f"corpus not found: {corpus}")
-    total = count_documents(corpus)
-    total = min(total, limit) if limit is not None else total
+    paths = list_sources(corpus)[:limit]
 
+    t0 = time.perf_counter()
     with Progress(
         TextColumn("indexing"),
         BarColumn(),
@@ -94,17 +107,28 @@ def index_cmd(
         console=err,
         transient=True,
     ) as progress:
-        task = progress.add_task("docs", total=total)
-
-        def tracked() -> Iterator[Document]:
-            for doc in islice(iter_documents(corpus), limit):
-                yield doc
-                progress.advance(task)
-
-        index, t_build, peak = measure(lambda: build_index(tracked(), positions=positions))
-    _, t_save, _ = measure(lambda: save(index, out_path))
+        task = progress.add_task("files", total=len(paths))
+        index, stats = build_parallel(
+            paths,
+            workers=workers,
+            executor=executor.value,
+            positions=positions,
+            on_chunk_done=lambda n: progress.advance(task, n),
+        )
+    t_build = time.perf_counter() - t0
+    t1 = time.perf_counter()
+    save(index, out_path)
+    t_save = time.perf_counter() - t1
     n_postings = sum(len(p) for p in index.postings.values())
-    log.info("build %.2f s (peak %.1f MiB), save %.2f s", t_build, peak / 2**20, t_save)
+    log.info(
+        "build %.2f s (%s x%d, %d chunks, merge %.2f s), save %.2f s",
+        t_build,
+        executor.value,
+        workers,
+        stats.chunks,
+        stats.merge_seconds,
+        t_save,
+    )
     out.print(
         f"{index!r}: {n_postings:,} postings -> {out_path} "
         f"({out_path.stat().st_size / 2**20:.1f} MiB) in {t_build + t_save:.1f} s"

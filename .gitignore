@@ -9,3 +9,4 @@ dist/
 /index*.json
 .coverage
 .hypothesis/
+.venv-ft/

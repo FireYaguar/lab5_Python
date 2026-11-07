@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,34 +33,62 @@ def _title_from(text: str, fallback: str) -> str:
 
 
 def _iter_jsonl(path: Path, start_id: int) -> Iterator[Document]:
-    doc_id = start_id
+    """doc_id = start_id + line index, so ids depend only on the file, not on what was
+    skipped before (bad/blank lines leave gaps). That makes ids stable when the corpus
+    is split into chunks for parallel indexing (Lab 5)."""
     with path.open(encoding="utf-8", errors="replace") as f:
-        for lineno, line in enumerate(f, 1):  # the file is an iterator of lines
+        for i, line in enumerate(f):  # the file is an iterator of lines
             if not line.strip():
                 continue
             try:
                 rec = json.loads(line)
                 text = str(rec["text"])
             except (json.JSONDecodeError, KeyError, TypeError) as e:
-                log.warning("skip %s:%d: %s", path, lineno, e)
+                log.warning("skip %s:%d: %s", path, i + 1, e)
                 continue
-            src = str(rec.get("url") or f"{path}#{lineno}")
-            yield Document(doc_id, src, str(rec.get("title") or _title_from(text, src)), text)
-            doc_id += 1
+            src = str(rec.get("url") or f"{path}#{i + 1}")
+            title = str(rec.get("title") or _title_from(text, src))
+            yield Document(start_id + i, src, title, text)
+
+
+def list_sources(root: Path) -> list[Path]:
+    """All corpus files in a stable (sorted) order. Only paths are materialized, not text."""
+    paths = [root] if root.is_file() else sorted(root.rglob("*"))
+    return [p for p in paths if p.is_file() and p.suffix.lower() in TEXT_SUFFIXES | {".jsonl"}]
+
+
+def source_size(path: Path) -> int:
+    """How many doc_ids a source reserves: 1 for a text file, one per line for .jsonl."""
+    if path.suffix.lower() == ".jsonl":
+        with path.open("rb") as f:
+            return sum(1 for _ in f)
+    return 1
 
 
 def count_documents(root: Path) -> int:
-    """Cheap upper bound for a progress bar: text files + lines of .jsonl files."""
-    paths = [root] if root.is_file() else root.rglob("*")
-    n = 0
+    """Upper bound for a progress bar (= the doc_id range of the whole corpus)."""
+    return sum(source_size(p) for p in list_sources(root))
+
+
+def iter_source(path: Path, start_id: int) -> Iterator[Document]:
+    """Documents of one file; ids start at start_id."""
+    if path.suffix.lower() == ".jsonl":
+        yield from _iter_jsonl(path, start_id)
+        return
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        log.warning("bad UTF-8 in %s, replacing undecodable bytes", path)
+        text = raw.decode("utf-8", errors="replace")
+    yield Document(start_id, str(path), _title_from(text, path.stem), text)
+
+
+def iter_paths(paths: Iterable[Path], start_id: int = 0) -> Iterator[Document]:
+    """Documents of several sources; each source gets the next source_size() ids."""
     for path in paths:
-        suffix = path.suffix.lower()
-        if suffix == ".jsonl":
-            with path.open("rb") as f:
-                n += sum(1 for _ in f)
-        elif suffix in TEXT_SUFFIXES and path.is_file():
-            n += 1
-    return n
+        yield from iter_source(path, start_id)
+        start_id += source_size(path)
 
 
 def iter_documents(root: Path) -> Iterator[Document]:
@@ -69,21 +97,4 @@ def iter_documents(root: Path) -> Iterator[Document]:
     Generator: opens one file at a time. Files that are not valid UTF-8 are read
     with errors="replace" and logged, so one bad file never stops a build.
     """
-    paths = [root] if root.is_file() else sorted(root.rglob("*"))
-    # sorted() materializes only the *paths* (small), so doc_ids are stable across runs.
-    doc_id = 0
-    for path in paths:
-        suffix = path.suffix.lower()
-        if suffix == ".jsonl":
-            for doc in _iter_jsonl(path, doc_id):
-                yield doc
-                doc_id = doc.doc_id + 1
-        elif suffix in TEXT_SUFFIXES and path.is_file():
-            raw = path.read_bytes()
-            try:
-                text = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                log.warning("bad UTF-8 in %s, replacing undecodable bytes", path)
-                text = raw.decode("utf-8", errors="replace")
-            yield Document(doc_id, str(path), _title_from(text, path.stem), text)
-            doc_id += 1
+    yield from iter_paths(list_sources(root))

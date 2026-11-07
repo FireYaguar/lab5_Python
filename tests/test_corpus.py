@@ -15,6 +15,6 @@ def test_iter_documents_is_lazy_and_reads_jsonl(tmp_path: Path) -> None:
     assert (first.doc_id, first.title) == (0, "Title A")
     rest = list(docs)
     assert [d.path for d in rest] == ["u1", str(tmp_path / "bad.txt")]
-    assert [d.doc_id for d in rest] == [1, 2]
+    assert [d.doc_id for d in rest] == [1, 3]  # b.jsonl reserves 2 ids (2 lines), 1 skipped
     assert "�" in rest[1].text  # undecodable bytes replaced, not a crash
     assert count_documents(tmp_path) == 4  # upper bound: the broken jsonl line counts too
