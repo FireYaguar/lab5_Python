@@ -1,6 +1,6 @@
 # findex
 
-[![CI](https://github.com/OWNER/findex/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/findex/actions/workflows/ci.yml)
+[![CI](https://github.com/FireYaguar/lab5_Python/actions/workflows/ci.yml/badge.svg)](https://github.com/FireYaguar/lab5_Python/actions/workflows/ci.yml)
 
 Повнотекстовий пошуковик, який будую протягом семестру (курс «Python — Build a Search Engine», 8 лабораторних).
 Кожна лабораторна — окремий git-тег (`lab-01`, `lab-02`, …).
